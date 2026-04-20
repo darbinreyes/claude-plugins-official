@@ -51,6 +51,7 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const SPILL_DIR = join(STATE_DIR, 'spill')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
@@ -58,6 +59,7 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(SPILL_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
@@ -568,6 +570,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Reply landed → the oldest unreplied inbound for this chat is
+        // assumed answered. Remove it from the spill so the retry loop
+        // stops trying to re-fire it.
+        spillAckOldest(chat_id)
+
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -891,6 +898,123 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// ===== Inbound spill + retry =====
+// MCP stdio notifications are fire-and-forget — the write succeeds as long as
+// stdout is open, but we can't tell whether Claude actually processed the
+// message. If Claude is mid-turn when the notification arrives, it may be
+// dropped silently. Spilling every inbound to disk lets us: (1) replay on
+// startup (bot came up before Claude was ready), (2) retry stuck messages
+// periodically when no reply has come back, (3) give up cleanly after a
+// configurable limit.
+
+type SpillEntry = {
+  method: 'notifications/claude/channel'
+  params: { content: string; meta: Record<string, string> }
+  chat_id: string
+  first_attempt: number
+  last_attempt: number
+  attempts: number
+}
+
+function spillFilename(entry: SpillEntry): string {
+  const msgId = entry.params.meta.message_id ?? 'nomsg'
+  return `${entry.first_attempt}-${entry.chat_id}-${msgId}.json`
+}
+
+function spillWrite(entry: SpillEntry): void {
+  const path = join(SPILL_DIR, spillFilename(entry))
+  const tmp = path + '.tmp'
+  writeFileSync(tmp, JSON.stringify(entry, null, 2), { mode: 0o600 })
+  renameSync(tmp, path)
+}
+
+function spillRead(filename: string): SpillEntry | null {
+  try {
+    return JSON.parse(readFileSync(join(SPILL_DIR, filename), 'utf8')) as SpillEntry
+  } catch {
+    return null
+  }
+}
+
+function spillDelete(filename: string): void {
+  try { rmSync(join(SPILL_DIR, filename), { force: true }) } catch {}
+}
+
+function spillList(): Array<{ filename: string; entry: SpillEntry }> {
+  let files: string[]
+  try { files = readdirSync(SPILL_DIR) } catch { return [] }
+  const out: Array<{ filename: string; entry: SpillEntry }> = []
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue
+    const entry = spillRead(f)
+    if (entry) out.push({ filename: f, entry })
+  }
+  // Chronological — oldest first.
+  out.sort((a, b) => a.entry.first_attempt - b.entry.first_attempt)
+  return out
+}
+
+// Called by the reply tool when Claude responds to a chat. The oldest
+// unreplied spill for that chat is assumed to be the one Claude just
+// answered — imperfect but works in practice because Claude processes
+// channel notifications in order.
+function spillAckOldest(chat_id: string): void {
+  const all = spillList()
+  const oldest = all.find(x => x.entry.chat_id === chat_id)
+  if (oldest) spillDelete(oldest.filename)
+}
+
+// Retry policy — decides what to do with each pending spill on every tick.
+// Aggressive: retry up to 5 times with ≥1 min between attempts, give up
+// after 10 min. Prevents unbounded spill growth while giving Claude
+// multiple chances to process messages that arrived during busy windows.
+type RetryAction = 'retry' | 'skip' | 'give_up'
+function decideRetryAction(entry: SpillEntry, now: number): RetryAction {
+  const age = now - entry.first_attempt
+  if (age > 10 * 60_000 || entry.attempts >= 5) return 'give_up'
+  if (now - entry.last_attempt < 60_000) return 'skip'
+  return 'retry'
+}
+
+async function fireNotification(entry: SpillEntry): Promise<void> {
+  await mcp.notification({ method: entry.method, params: entry.params })
+}
+
+function retryTick(): void {
+  const now = Date.now()
+  for (const { filename, entry } of spillList()) {
+    const action = decideRetryAction(entry, now)
+    if (action === 'skip') continue
+    if (action === 'give_up') {
+      process.stderr.write(`telegram channel: giving up on spill ${filename} after ${entry.attempts} attempts\n`)
+      spillDelete(filename)
+      continue
+    }
+    // retry — re-fire the notification, bump counters, rewrite the file
+    entry.attempts += 1
+    entry.last_attempt = now
+    spillWrite(entry)
+    fireNotification(entry).catch(err => {
+      process.stderr.write(`telegram channel: spill retry failed for ${filename}: ${err}\n`)
+    })
+  }
+}
+
+// Boot replay: any spill files from a previous run (or this run before
+// Claude was ready) get re-fired immediately.
+for (const { filename, entry } of spillList()) {
+  entry.attempts += 1
+  entry.last_attempt = Date.now()
+  spillWrite(entry)
+  fireNotification(entry).catch(err => {
+    process.stderr.write(`telegram channel: boot replay failed for ${filename}: ${err}\n`)
+  })
+}
+
+// Periodic tick — cadence is fixed at 30s; the decideRetryAction policy
+// decides whether each individual entry is actually retried on this tick.
+setInterval(retryTick, 30_000).unref()
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -954,7 +1078,8 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
+  const now = Date.now()
+  const entry: SpillEntry = {
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -974,7 +1099,17 @@ async function handleInbound(
         } : {}),
       },
     },
-  }).catch(err => {
+    chat_id,
+    first_attempt: now,
+    last_attempt: now,
+    attempts: 1,
+  }
+
+  // Spill BEFORE firing the notification so a crash between spill and fire
+  // still results in a replay on next boot. spillWrite is synchronous.
+  spillWrite(entry)
+
+  fireNotification(entry).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
