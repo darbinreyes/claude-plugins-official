@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-plugins-official",
-  "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
+  "name": "darbinreyes-plugins",
+  "description": "Local fork with telegram spill+retry patch.",
   "owner": {
-    "name": "Anthropic",
-    "email": "support@anthropic.com"
+    "name": "darbinreyes",
+    "email": "darbinreyes@proton.me"
   },
   "plugins": [
     {
